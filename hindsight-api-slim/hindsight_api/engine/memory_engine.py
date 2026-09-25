@@ -667,6 +667,7 @@ from .response_models import (
 )
 from .response_models import RecallResult as RecallResultModel
 from .retain import bank_utils, embedding_utils
+from .retain.fact_storage import _normalize_scopes
 from .retain.fold import FoldMemberRef
 from .retain.types import RetainBatchResult, RetainContentDict, merge_processed_content_tokens
 from .search.reranking import CrossEncoderReranker, apply_combined_scoring
@@ -717,6 +718,30 @@ class _LLMCallDefaults:
             "initial_backoff": self.initial_backoff,
             "max_backoff": self.max_backoff,
         }
+
+
+@dataclass(frozen=True)
+class BankFileStream:
+    """Stream of bytes for a bank-scoped stored file with optional content length."""
+
+    stream: AsyncIterator[bytes]
+    size: int | None
+
+
+@dataclass
+class ByteStreamCounter:
+    """Async iterator that counts total bytes yielded by the wrapped byte stream."""
+
+    stream: AsyncIterator[bytes]
+    total_bytes: int = 0
+
+    def __aiter__(self) -> AsyncIterator[bytes]:
+        return self
+
+    async def __anext__(self) -> bytes:
+        chunk = await self.stream.__anext__()
+        self.total_bytes += len(chunk)
+        return chunk
 
 
 def _member_to_llm(member: "LLMMemberConfig", config: HindsightConfig, defaults: _LLMCallDefaults) -> LLMConfig:
@@ -1935,6 +1960,26 @@ def _summarize_refresh_tool_calls(
     return summaries
 
 
+def _renamed_scopes(scopes: Any, old_tags: list[str] | None, new_tags: list[str]) -> Any:
+    """Move a single-tag rename into an explicit ``observation_scopes`` spec (#4609).
+
+    An explicit ``list[list[str]]`` spec freezes tag strings at retain time, so a retag
+    that renames ``project:old`` -> ``project:new`` would leave consolidation rebuilding
+    observations under the old tag. Scalar modes re-derive from the unit's fresh tags
+    and need nothing. Only an unambiguous rename (exactly one tag removed, one added)
+    is remapped; any other retag returns the spec unchanged.
+    """
+    scopes = _normalize_scopes(scopes)
+    if not isinstance(scopes, list) or old_tags is None:
+        return scopes
+    removed = set(old_tags) - set(new_tags)
+    added = set(new_tags) - set(old_tags)
+    if len(removed) != 1 or len(added) != 1:
+        return scopes
+    old, new = removed.pop(), added.pop()
+    return [[new if t == old else t for t in scope] for scope in scopes]
+
+
 def _operation_details(operation_type: str, result_metadata: dict[str, Any]) -> dict[str, Any] | None:
     """Typed per-operation-type outcome detail, projected out of result_metadata.
 
@@ -3149,39 +3194,37 @@ class MemoryEngine(MemoryEngineInterface):
         if not bank_id:
             raise ValueError("bank_id is required for export_documents task")
 
-        from hindsight_api.models import RequestContext
+        from .memories import get_memories
+        from .transfer import stream_export_documents
 
-        context = RequestContext(
-            internal=True,
-            user_initiated=True,
-            tenant_id=task_dict.get("_tenant_id"),
-            api_key_id=task_dict.get("_api_key_id"),
-            retry_count=task_dict.get("_retry_count", 0),
-        )
-
-        archive_bytes = await self.export_documents_async(
+        backend = await self._get_backend()
+        stream = stream_export_documents(
+            backend,
             bank_id,
-            context,
             document_ids,
             include_observations=include_observations,
             include_knowledge_base=include_knowledge_base,
+            memories=get_memories(),
         )
+
+        counter = ByteStreamCounter(stream)
 
         # A fresh uuid per export keeps concurrent/repeat exports of the same bank
         # from clobbering each other's archive.
         storage_key = f"{bank_storage_prefix(bank_id)}exports/{uuid.uuid4()}/transfer.zip"
-        await self._file_storage.store(
-            file_data=archive_bytes,
+        await self._file_storage.store_stream(
             key=storage_key,
+            stream=counter,
             metadata={"content_type": "application/zip", "bank_id": bank_id},
         )
+        total_bytes = counter.total_bytes
         download_url = await self._file_storage.get_download_url(storage_key)
 
         if operation_id:
             result = {
                 "storage_key": storage_key,
                 "download_url": download_url,
-                "byte_size": len(archive_bytes),
+                "byte_size": total_bytes,
                 "filename": f"{bank_id}-documents.zip",
             }
             backend = await self._get_backend()
@@ -3205,7 +3248,7 @@ class MemoryEngine(MemoryEngineInterface):
         import json
 
         from .memories import get_memories
-        from .transfer import TransferScope, build_bank_archive, load_bank_export
+        from .transfer import TransferScope, stream_export_bank
 
         bank_id = task_dict.get("bank_id")
         operation_id = task_dict.get("operation_id")
@@ -3217,36 +3260,36 @@ class MemoryEngine(MemoryEngineInterface):
             history=task_dict.get("include_history", False),
         )
 
+        # Note on snapshot consistency vs. connection hold trade-off:
+        # stream_export_bank streams sections and batches in separate short-lived
+        # connections rather than wrapping the entire export in a single long transaction.
+        # This prevents connection pool exhaustion when banks have gigabytes of attachments
+        # or documents, producing an eventual snapshot across batches.
         backend = await self._get_backend()
-        # One connection for the whole read: a bank is read across a dozen
-        # queries, and a transaction is what makes them one point in time rather
-        # than a smear of whatever was being written meanwhile. Only the *read*
-        # is in here — building the archive is CPU-bound and runs after the
-        # connection is back in the pool (see build_bank_archive).
-        async with acquire_with_retry(backend) as conn:
-            async with conn.transaction():
-                payload = await load_bank_export(
-                    conn,
-                    bank_id,
-                    scope=scope,
-                    memories=get_memories(),
-                    file_storage=self._file_storage,
-                )
-        archive_bytes = await build_bank_archive(payload)
+        stream = stream_export_bank(
+            backend,
+            bank_id,
+            scope=scope,
+            memories=get_memories(),
+            file_storage=self._file_storage,
+        )
+
+        counter = ByteStreamCounter(stream)
 
         storage_key = f"banks/{bank_id}/exports/{uuid.uuid4()}/transfer.zip"
-        await self._file_storage.store(
-            file_data=archive_bytes,
+        await self._file_storage.store_stream(
             key=storage_key,
+            stream=counter,
             metadata={"content_type": "application/zip", "bank_id": bank_id},
         )
+        total_bytes = counter.total_bytes
         download_url = await self._file_storage.get_download_url(storage_key)
 
         if operation_id:
             result = {
                 "storage_key": storage_key,
                 "download_url": download_url,
-                "byte_size": len(archive_bytes),
+                "byte_size": total_bytes,
                 "filename": f"{bank_id}-bank.zip",
             }
             async with acquire_with_retry(backend) as conn:
@@ -3335,9 +3378,14 @@ class MemoryEngine(MemoryEngineInterface):
 
         The archive never leaves this process — a clone is both halves of a
         transfer on one instance, so stashing it in file storage would only add a
-        round trip and a blob to clean up. Everything else is the transfer path
-        exactly as it stands, which is the point: a clone cannot drift from what
-        export/import do.
+        round trip and a blob to clean up.
+
+        Architecture note on clone vs export strategy:
+        Unlike external export which streams chunks across short-lived connections
+        to prevent connection pool starvation during long network transfers, a live
+        clone loads the source bank under a single read transaction (conn.transaction())
+        to maintain snapshot consistency and prevent point-in-time relational smears
+        while the source bank is actively being written to.
         """
         import json
 
@@ -3462,7 +3510,7 @@ class MemoryEngine(MemoryEngineInterface):
         """
         rows = await conn.fetch(
             f"""SELECT result_metadata FROM {table}
-                WHERE operation_type = 'export_documents'
+                WHERE operation_type IN ('export_documents', 'export_bank')
                   AND status IN ('completed', 'failed', 'cancelled')
                   AND updated_at < $1
                 ORDER BY updated_at, operation_id
@@ -7295,19 +7343,22 @@ class MemoryEngine(MemoryEngineInterface):
             task_payload=task_payload,
         )
 
-    async def retrieve_bank_file(
+    async def retrieve_bank_file_stream(
         self,
         bank_id: str,
         storage_key: str,
         request_context: "RequestContext",
-    ) -> bytes | None:
-        """Retrieve a bank-scoped stored file (e.g. an async export archive).
+    ) -> BankFileStream | None:
+        """Stream a bank-scoped stored file (e.g. an async export archive).
 
         Authorizes the caller against ``bank_id`` first (via ``get_bank_profile``,
         which authenticates the tenant), so a caller can't read another tenant's or
         bank's file even if they guess the key. Returns ``None`` when the bank is
         not visible to the caller or the file does not exist — the handler maps
         both to 404 (indistinguishable on purpose, so keys can't be probed).
+
+        Returns a BankFileStream holding the byte stream and file size in bytes
+        (where size may be None if unknown).
         """
         profile = await self.get_bank_profile(bank_id, request_context=request_context)
         if profile is None:
@@ -7319,10 +7370,10 @@ class MemoryEngine(MemoryEngineInterface):
         if not storage_key.startswith((bank_storage_prefix(bank_id), f"banks/{bank_id}/")):
             return None
         await self._get_backend()
-        try:
-            return await self._file_storage.retrieve(storage_key)
-        except FileNotFoundError:
+        if not await self._file_storage.exists(storage_key):
             return None
+        size = await self._file_storage.get_size(storage_key)
+        return BankFileStream(stream=self._file_storage.retrieve_stream(storage_key), size=size)
 
     async def _retain_attachment_info(
         self,
@@ -7692,7 +7743,7 @@ class MemoryEngine(MemoryEngineInterface):
         Returns ``None`` both when the bank is not visible to the caller and when
         the image does not exist — indistinguishable on purpose, so a caller
         cannot probe for which images a bank holds. Same guarantee as
-        :meth:`retrieve_bank_file`, and the reason the id alone is not a
+        :meth:`retrieve_bank_file_stream`, and the reason the id alone is not a
         capability: it is derived from the content, so anyone holding the same
         image could otherwise read whether some bank had also retained it.
         """
@@ -10688,6 +10739,7 @@ class MemoryEngine(MemoryEngineInterface):
         async with acquire_with_retry(backend) as conn:
             async with conn.transaction():
                 from .memories import MemoryPatch, get_memories
+                from .memories.base import META_OBSERVATION_SCOPES
                 from .retain.entity_labels import label_tag_keys, split_label_tags
 
                 _store = get_memories()
@@ -10796,9 +10848,14 @@ class MemoryEngine(MemoryEngineInterface):
                     )
                     _doc_units = _doc_page.memories
                     if _doc_units:
-                        await _store.update_memories(
-                            bank_id, [MemoryPatch(unit_id=m.unit_id, tags=_retagged(m.tags)) for m in _doc_units]
-                        )
+                        _patches = []
+                        for m in _doc_units:
+                            _patch = MemoryPatch(unit_id=m.unit_id, tags=_retagged(m.tags))
+                            _scopes = _renamed_scopes(m.observation_scopes, current_tags, retag)
+                            if _scopes != _normalize_scopes(m.observation_scopes):
+                                _patch.metadata = {META_OBSERVATION_SCOPES: json.dumps(_scopes)}
+                            _patches.append(_patch)
+                        await _store.update_memories(bank_id, _patches)
                     _src_ids = [m.unit_id for m in _doc_units if m.fact_type in ("experience", "world")]
                     if _src_ids:
                         invalidated_obs = await _store.delete_stale_observations(
@@ -10811,11 +10868,24 @@ class MemoryEngine(MemoryEngineInterface):
                     # `tags` as well as `id`: the projection each unit must keep is read
                     # here, before the blanket write below overwrites it.
                     unit_rows = await conn.fetch(
-                        f"SELECT id, tags, fact_type FROM {fq_table('memory_units')} "
+                        f"SELECT id, tags, fact_type, observation_scopes FROM {fq_table('memory_units')} "
                         f"WHERE document_id = $1 AND bank_id = $2",
                         document_id,
                         bank_id,
                     )
+                    _by_scopes: dict[str, list] = {}
+                    for _row in unit_rows:
+                        _scopes = _renamed_scopes(_row["observation_scopes"], current_tags, retag)
+                        if _scopes != _normalize_scopes(_row["observation_scopes"]):
+                            _by_scopes.setdefault(json.dumps(_scopes), []).append(_row["id"])
+                    for _scopes_json, _ids in _by_scopes.items():
+                        await conn.execute(
+                            f"UPDATE {fq_table('memory_units')} SET observation_scopes = $1 "
+                            f"WHERE bank_id = $2 AND id = ANY($3::uuid[])",
+                            _scopes_json,
+                            bank_id,
+                            _ids,
+                        )
                     unit_ids = [str(row["id"]) for row in unit_rows if row["fact_type"] in ("experience", "world")]
 
                     await conn.execute(
